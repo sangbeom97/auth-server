@@ -6,6 +6,11 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
+@app.get("/__routes")
+def __routes():
+    return "\n".join(sorted([f"{r.methods} {r.rule}" for r in app.url_map.iter_rules()]))
+
+
 DB_PATH = os.environ.get("DB_PATH", "auth.db")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # Render Environment Variables에 넣는 키
 PORT = int(os.environ.get("PORT", "10000"))
