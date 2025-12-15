@@ -180,7 +180,7 @@ def admin_approve():
     if not admin_auth_ok(request):
         return jsonify({"ok": False, "reason": "unauthorized"}), 403
 
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(force=True, silent=True) or {}
     user_id = (data.get("id") or "").strip()
     approved = data.get("approved")
     expire_at = (data.get("expire_at") or "").strip()
