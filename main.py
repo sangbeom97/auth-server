@@ -1,63 +1,67 @@
 import os
-import sqlite3
 from datetime import datetime, date
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 app = Flask(__name__)
 
-@app.get("/__routes")
-def __routes():
-    return "\n".join(sorted([f"{r.methods} {r.rule}" for r in app.url_map.iter_rules()]))
-
-
-DB_PATH = os.environ.get("DB_PATH", "auth.db")
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # Render Environment Variables에 넣는 키
+ADMIN_KEY = (os.environ.get("ADMIN_KEY") or "").strip()
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 PORT = int(os.environ.get("PORT", "10000"))
 
+# ---------- DB helpers ----------
+def _normalize_db_url(db_url: str) -> str:
+    """
+    Supabase direct URL은 SSL이 필수인 경우가 많아서 sslmode=require를 보장.
+    """
+    if not db_url:
+        return db_url
+    u = urlparse(db_url)
+    qs = parse_qs(u.query)
+    if "sslmode" not in qs:
+        qs["sslmode"] = ["require"]
+    new_query = urlencode(qs, doseq=True)
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
 
-# -----------------------------
-# DB
-# -----------------------------
+
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not configured")
+    return psycopg2.connect(_normalize_db_url(DATABASE_URL), cursor_factory=RealDictCursor)
 
 
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            pw_hash TEXT NOT NULL,
-            approved INTEGER NOT NULL DEFAULT 0,
-            expire_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id          TEXT PRIMARY KEY,
+                    pw_hash     TEXT NOT NULL,
+                    approved    BOOLEAN NOT NULL DEFAULT FALSE,
+                    expire_at   DATE,
+                    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+        conn.commit()
 
 
-init_db()
-
-
-# -----------------------------
-# Utils
-# -----------------------------
-def today_date():
+def today_date() -> date:
     return datetime.now().date()
 
 
-def parse_ymd(s: str):
-    # YYYY-MM-DD
+def parse_ymd(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
 def admin_auth_ok(req) -> bool:
     """
-    관리자 키는 아래 두 방식 모두 허용:
+    관리자 키 허용 방식:
     1) Header: X-ADMIN-KEY: <value>
     2) JSON body: {"admin_key": "<value>"}
     """
@@ -65,122 +69,107 @@ def admin_auth_ok(req) -> bool:
         return False
 
     got_header = (req.headers.get("X-ADMIN-KEY") or "").strip()
-    got_json = ""
     j = req.get_json(silent=True) or {}
+    got_json = ""
     if isinstance(j, dict):
         got_json = (j.get("admin_key") or "").strip()
 
     return (got_header == ADMIN_KEY) or (got_json == ADMIN_KEY)
 
 
-# -----------------------------
-# Routes
-# -----------------------------
+# ---------- routes ----------
 @app.get("/")
-def home():
-    # Render 헬스체크용
-    return jsonify({"ok": True, "service": "auth-server"})
+def health():
+    return jsonify({"ok": True, "service": "auth-server"}), 200
+
+
+@app.get("/__routes")
+def __routes():
+    return "\n".join(sorted([f"{list(r.methods)} {r.rule}" for r in app.url_map.iter_rules()])), 200
 
 
 @app.post("/register")
 def register():
-    """
-    사용자 회원가입 (누구나 가능)
-    - 기본: approved=0 (관리자 승인 전)
-    """
+    init_db()
     data = request.get_json(silent=True) or {}
     user_id = (data.get("id") or "").strip()
-    user_pw = (data.get("pw") or "")
+    pw = (data.get("pw") or "").strip()
 
-    if not user_id or not user_pw:
+    if not user_id or not pw:
         return jsonify({"ok": False, "reason": "missing_id_or_pw"}), 400
 
-    pw_hash = generate_password_hash(user_pw)
+    pw_hash = generate_password_hash(pw)
 
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-    exists = cur.fetchone()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM users WHERE id=%s", (user_id,))
+                row = cur.fetchone()
+                if row:
+                    return jsonify({"ok": False, "reason": "already_exists"}), 200
 
-    if exists:
-        conn.close()
-        return jsonify({"ok": False, "reason": "user_exists"}), 409
+                cur.execute(
+                    "INSERT INTO users (id, pw_hash, approved) VALUES (%s, %s, %s)",
+                    (user_id, pw_hash, False),
+                )
+            conn.commit()
+    except Exception as e:
+        return jsonify({"ok": False, "reason": "db_error", "detail": str(e)}), 500
 
-    cur.execute(
-        "INSERT INTO users (id, pw_hash, approved, expire_at) VALUES (?, ?, 0, NULL)",
-        (user_id, pw_hash),
-    )
-    conn.commit()
-    conn.close()
-
-    return jsonify({"ok": True, "id": user_id, "approved": False})
+    return jsonify({"ok": True, "id": user_id, "approved": False}), 200
 
 
 @app.post("/login")
 def login():
-    """
-    클라이언트(EXE)가 주기적으로 호출할 API
-    응답:
-      - ok=true  => 사용 가능(승인/만료 통과)
-      - ok=false => no_user / wrong_pw / not_approved / expired
-    """
+    init_db()
     data = request.get_json(silent=True) or {}
     user_id = (data.get("id") or "").strip()
-    user_pw = (data.get("pw") or "")
+    pw = (data.get("pw") or "").strip()
 
-    if not user_id or not user_pw:
+    if not user_id or not pw:
         return jsonify({"ok": False, "reason": "missing_id_or_pw"}), 400
 
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id, pw_hash, approved, expire_at FROM users WHERE id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, pw_hash, approved, expire_at FROM users WHERE id=%s",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        return jsonify({"ok": False, "reason": "db_error", "detail": str(e)}), 500
 
     if not row:
         return jsonify({"ok": False, "reason": "no_user"}), 200
 
-    if not check_password_hash(row["pw_hash"], user_pw):
+    if not check_password_hash(row["pw_hash"], pw):
         return jsonify({"ok": False, "reason": "wrong_pw"}), 200
 
-    if int(row["approved"]) != 1:
+    # 승인 체크
+    if not row["approved"]:
         return jsonify({"ok": False, "reason": "not_approved"}), 200
 
-    expire_at = row["expire_at"]
-    if not expire_at:
-        # 승인 되었는데 만료일이 없으면(관리자 설정 실수) 막아두는 게 안전
-        return jsonify({"ok": False, "reason": "no_expire_set"}), 200
+    # 만료 체크
+    expire_at = row.get("expire_at")
+    if expire_at:
+        if today_date() > expire_at:
+            return jsonify({"ok": False, "reason": "expired", "expire_at": str(expire_at)}), 200
 
-    try:
-        exp = parse_ymd(expire_at)
-    except Exception:
-        return jsonify({"ok": False, "reason": "bad_expire_format", "expire_at": expire_at}), 200
-
-    if today_date() > exp:
-        return jsonify({"ok": False, "reason": "expired", "expire_at": expire_at}), 200
-
-    return jsonify({"ok": True, "expire_at": expire_at}), 200
+    return jsonify({"ok": True, "expire_at": (str(expire_at) if expire_at else "")}), 200
 
 
 @app.post("/admin/approve")
 def admin_approve():
-    """
-    관리자 승인/기간 설정
-    입력(JSON):
-      - id: 대상 사용자 id
-      - approved: 1 또는 0
-      - expire_at: "YYYY-MM-DD"  (approved=1일 때 필수 추천)
-    관리자키:
-      - Header: X-ADMIN-KEY
-      - 또는 JSON: admin_key
-    """
+    init_db()
+
     if not ADMIN_KEY:
         return jsonify({"ok": False, "reason": "admin_key_not_configured"}), 500
 
     if not admin_auth_ok(request):
         return jsonify({"ok": False, "reason": "unauthorized"}), 403
 
-    data = request.get_json(force=True, silent=True) or {}
+    data = request.get_json(silent=True) or {}
     user_id = (data.get("id") or "").strip()
     approved = data.get("approved")
     expire_at = (data.get("expire_at") or "").strip()
@@ -188,44 +177,35 @@ def admin_approve():
     if not user_id:
         return jsonify({"ok": False, "reason": "missing_id"}), 400
 
-    if approved is None:
-        return jsonify({"ok": False, "reason": "missing_approved"}), 400
+    # approved: 1/0, true/false 모두 허용
+    approved_bool = bool(int(approved)) if isinstance(approved, (int, str)) and str(approved).isdigit() else bool(approved)
 
-    approved_int = 1 if str(approved) in ["1", "true", "True"] else 0
-
-    if approved_int == 1:
-        if not expire_at:
-            return jsonify({"ok": False, "reason": "missing_expire_at"}), 400
+    exp_date = None
+    if expire_at:
         try:
-            _ = parse_ymd(expire_at)
+            exp_date = parse_ymd(expire_at)
         except Exception:
-            return jsonify({"ok": False, "reason": "bad_expire_format"}), 400
-    else:
-        # 승인 해제 시 만료일도 비워둘지 유지할지는 취향인데, 여기선 유지
-        # expire_at를 지우고 싶으면 expire_at=None 처리로 바꾸면 됨
-        pass
+            return jsonify({"ok": False, "reason": "bad_expire_format", "expire_at": expire_at}), 400
 
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return jsonify({"ok": False, "reason": "no_user"}), 404
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 존재 체크
+                cur.execute("SELECT id FROM users WHERE id=%s", (user_id,))
+                if not cur.fetchone():
+                    return jsonify({"ok": False, "reason": "no_user"}), 404
 
-    cur.execute(
-        "UPDATE users SET approved = ?, expire_at = ? WHERE id = ?",
-        (approved_int, expire_at if expire_at else None, user_id),
-    )
-    conn.commit()
-    conn.close()
+                cur.execute(
+                    "UPDATE users SET approved=%s, expire_at=%s WHERE id=%s",
+                    (approved_bool, exp_date, user_id),
+                )
+            conn.commit()
+    except Exception as e:
+        return jsonify({"ok": False, "reason": "db_error", "detail": str(e)}), 500
 
-    return jsonify({"ok": True, "id": user_id, "approved": bool(approved_int), "expire_at": expire_at or None})
+    return jsonify({"ok": True, "id": user_id, "approved": approved_bool, "expire_at": expire_at}), 200
 
 
-# -----------------------------
-# Run
-# -----------------------------
 if __name__ == "__main__":
-    # Render는 PORT 환경변수를 제공함
+    # 로컬 실행용
     app.run(host="0.0.0.0", port=PORT, debug=False)
