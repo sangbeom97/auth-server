@@ -1,3 +1,4 @@
 flask
-werkzeug
 gunicorn
+werkzeug
+psycopg2-binary
